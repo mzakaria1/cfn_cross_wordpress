@@ -1,0 +1,181 @@
+---
+# AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  # env:
+  #   Description: An environment name that is prefixed to resource names
+  #   Type: String
+  LatestAmiId:
+    Description: Region specific image from the Parameter Store
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  InstanceType:
+    Description: Amazon EC2 instance type for the instances
+    Type: String
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+    Default: t2.micro
+  KeyName:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Description: Key for EC2 instances to ssh
+    Default: zakaria-key
+                # =======================Resources=======================
+Resources:
+  # ================== LaunchConfiguration ===========================
+  WpEc2LC: 
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyName
+      SecurityGroups: 
+        - Ref: "WpEc2SG"
+      InstanceType: 
+        Ref: "InstanceType"
+      BlockDeviceMappings: 
+        - DeviceName: /dev/xvda
+          Ebs: 
+            VolumeSize: 8
+            VolumeType: "gp2"
+      UserData: 
+        Fn::Base64:
+          Fn::Sub:
+          - |
+            #!/bin/bash
+            yum update -y 
+            yum install -y httpd 
+            amazon-linux-extras install -y lamp-mariadb10.2-php7.2 php7.2
+            wget https://wordpress.org/latest.tar.gz
+            tar -xzf latest.tar.gz
+            cp -r wordpress/* /var/www/html/
+            service httpd start
+            cp /var/www/html/wp-config-sample.php  /var/www/html/wp-config.php
+            sed -i -e 's/database_name_here/wordpress/g' /var/www/html/wp-config.php
+            sed -i -e 's/username_here/wordpress/g' /var/www/html/wp-config.php
+            sed -i -e 's/password_here/wordpress/g' /var/www/html/wp-config.php
+            sed -i -e 's/localhost/${host}/g' /var/www/html/wp-config.php
+          - host: !ImportValue NLBDnsName
+                    
+      #============================ EC2 =================================
+  WpEc2SG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to client host
+      VpcId: !ImportValue dev-VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: -1
+        CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: dev-wp-sg-zakaria
+          
+    # ========================== WP-ASG =========================
+  WpEc2ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: '1'
+      MaxSize: '3'
+      DesiredCapacity: '2'
+      HealthCheckGracePeriod: 60
+      LaunchConfigurationName: !Ref WpEc2LC
+      VPCZoneIdentifier: !Split [",", !ImportValue 'dev-PrivateSubnetIDs']
+      TargetGroupARNs: 
+        - !Ref TargetGroupALB
+      Tags:
+        - Key: Name
+          Value: dev-wp-asg-zakaria
+          PropagateAtLaunch: true     # Required
+    
+    # =======================WP-Application Load Balancer===========================
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties: 
+      IpAddressType: ipv4
+      Name: !Sub wp-lb-zakaria
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Subnets: !Split [",", !ImportValue 'dev-PublicSubnetIDs']
+      # Subnets: !ImportValue dev-PublicSubnetIDs
+      Tags: 
+        - Key: Name
+          Value: dev-wp-lb-zakaria
+      Type: application
+    # ========================= ALB Listener ============================
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties: 
+      DefaultActions: 
+        - Type: "forward"
+          ForwardConfig: 
+            TargetGroups:
+              - TargetGroupArn: !Ref TargetGroupALB
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+    # ====================== ALB Security Group ========================
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: SG for ALB
+      GroupName: !Sub dev-alb-sg-zakaria
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: -1
+        CidrIp: 0.0.0.0/0
+      Tags: 
+        - Key: Name
+          Value: dev-alb-sg-zakaria
+      VpcId: !ImportValue dev-VPC
+
+    # =========================Target Group for ALB==============================
+  TargetGroupALB:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckPort: 80
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      Matcher: 
+        HttpCode: 200-302
+      Name: dev-alb-tg-zakaria
+      Port: 80
+      Protocol: HTTP
+      ProtocolVersion: HTTP1
+      Tags: 
+        - Key: Name
+          Value: dev-alb-tg-zakaria
+      TargetType: instance
+      UnhealthyThresholdCount: 2
+      VpcId: !ImportValue dev-VPC
+
+#  =========================Outputs===============================
+Outputs:
+  AlbDnsName:
+    Description: The Application load balancer DNS Name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: AlbDnsName
+
+
+  
+
+
+

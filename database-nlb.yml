@@ -1,0 +1,120 @@
+Parameters:
+  MysqlAMI:
+    Description: Region specific image from the Parameter Store
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/canonical/ubuntu/server/20.04/stable/current/amd64/hvm/ebs-gp2/ami-id'
+  KeyName:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Description: Key for EC2 instances to ssh
+    Default: zakaria-key
+  InstanceType:
+    Description: Amazon EC2 instance type for the instances
+    Type: String
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+    Default: t2.micro
+
+Resources:
+  # ============================= Network Load Balancer ================================
+  NetworkLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties: 
+      Name: dev-nlb-zakaria
+      Scheme: internal
+      Subnets: !Split [",", !ImportValue dev-PrivateSubnetIDs]
+      Tags: 
+        - Key: Name
+          Value: dev-nlb-zakaria
+      Type: network
+
+  # =========================== Target Group for Network Load Balancer MYSQL ============================
+  MysqlTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPort: 3306
+      HealthCheckProtocol: TCP
+      HealthyThresholdCount: 3
+      Name: dev-Nlb-tg-zakaria
+      Port: 3306
+      Protocol: TCP
+      Tags: 
+        - Key: Name
+          Value: dev-Nlb-tg-zakaria
+      Targets: 
+        - Id: !Ref  MysqlEC2
+          Port: 3306
+      TargetType: instance
+      VpcId: !ImportValue dev-VPC
+  
+  # ========================= NLB Listener ============================
+  NetworkLBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties: 
+      DefaultActions: 
+        - Type: "forward"
+          TargetGroupArn: !Ref MysqlTargetGroup
+      LoadBalancerArn: !Ref NetworkLB
+      Port: 3306
+      Protocol: TCP
+
+
+  # ============================= MYSql Security Group ===============================
+  MysqlSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: SecuPrivateSubnet2rity Group for Mysql EC2 Instance
+      GroupName: dev-mysql-sg-zakaria
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 3306
+        ToPort: 3306
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: -1
+        CidrIp: 0.0.0.0/0
+      Tags: 
+        - Key: Name
+          Value: dev-mysql-sg-zakaria
+      VpcId: !ImportValue dev-VPC
+  
+  # ================================ Msql EC2 Instance ====================================
+  MysqlEC2: 
+    Type: AWS::EC2::Instance
+    Properties: 
+      ImageId: !Ref MysqlAMI
+      KeyName: !Ref KeyName
+      InstanceType: !Ref InstanceType
+      BlockDeviceMappings: 
+      - DeviceName: /dev/sda1
+        Ebs: 
+          VolumeType: gp2
+          VolumeSize: 80
+      SecurityGroupIds: 
+        - !Ref MysqlSecurityGroup
+      SubnetId: !ImportValue PrivateSubnet2
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          apt update -y
+          apt install mysql-server net-tools -y
+          systemctl enable mysql
+          service mysql start
+          sed -i -e 's/127.0.0.1/0.0.0.0/g' /etc/mysql/mysql.conf.d/mysqld.cnf
+          systemctl restart mysql
+          service mysql restart
+          mysql -uroot -pwordpress -e  "CREATE DATABASE wordpress;use wordpress;FLUSH PRIVILEGES;create user 'wordpress'@'%' identified WITH mysql_native_password by 'wordpress';GRANT ALL ON wordpress.* TO ' wordpress '@'%'; "
+
+
+Outputs:
+  NLBDnsName:
+    Description: The DNS Name of Network Load Balancer
+    Value: !GetAtt  NetworkLB.DNSName
+    Export:
+      Name: NLBDnsName
+  
+
+
